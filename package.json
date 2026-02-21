@@ -1,0 +1,16 @@
+{
+    "name": "playsport-odds-api",
+    "version": "1.0.0",
+    "description": "SSE Server for Real-Time Odds Streaming",
+    "main": "server.js",
+    "type": "module",
+    "scripts": {
+        "start": "node server.js",
+        "dev": "node --watch server.js"
+    },
+    "dependencies": {
+        "cors": "^2.8.5",
+        "express": "^4.21.2",
+        "firebase": "^10.12.0"
+    }
+}

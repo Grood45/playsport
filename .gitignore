@@ -1,0 +1,26 @@
+# Node.js Dependencies
+node_modules/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment Variables (keep API keys safe)
+.env
+.env.local
+
+# Optional Tooling/OS Files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build/Cache Directories
+.npm/
+temp-npm-cache/
+dist/
+build/
+coverage/

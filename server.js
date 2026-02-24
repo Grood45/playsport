@@ -67,11 +67,12 @@ app.get('/api/stream/odds', (req, res) => {
     const streamData = (source, data) => {
         if (!isConnectionOpen) return;
 
-        // Formatting data beautiful and structured for client
+        // Clean, structured payload (removed all-field dump to avoid confusion)
         const payload = {
             market_type: source,
             market_name: data.marketName || data.name || "Unknown Market",
-            status: data.oddsData?.status || "UNKNOWN",
+            is_closed: data.isClosed ?? 0,
+            status: data.oddsData?.status || (data.isClosed === 0 ? "OPEN" : "CLOSED"),
             total_matched: data.oddsData?.totalMatched || data.totalMatched || 0,
             runners: (data.oddsData?.runners || data.runners || []).map(r => ({
                 id: r.selectionId,
@@ -118,7 +119,7 @@ app.get('/api/stream/odds', (req, res) => {
     unsubscribes.push(unsubBookmaker);
 
     // --- FANCY QUERY ---
-    const fancyQuery = query(collection(db, 'Fancy'), where('exEventId', '==', eventId), where('isClosed', '==', 0));
+    const fancyQuery = query(collection(db, 'Fancy'), where('exEventId', '==', eventId));
     const unsubFancy = onSnapshot(fancyQuery, (snapshot) => {
         snapshot.docChanges().forEach((change) => {
             if (change.type === "added" || change.type === "modified") {
@@ -129,7 +130,7 @@ app.get('/api/stream/odds', (req, res) => {
     unsubscribes.push(unsubFancy);
 
     // --- SPORTSBOOK QUERY ---
-    const sportsbookQuery = query(collection(db, 'Sportsbook'), where('exEventId', '==', eventId), where('isClosed', '==', 0));
+    const sportsbookQuery = query(collection(db, 'Sportsbook'), where('exEventId', '==', eventId));
     const unsubSportsbook = onSnapshot(sportsbookQuery, (snapshot) => {
         snapshot.docChanges().forEach((change) => {
             if (change.type === "added" || change.type === "modified") {
@@ -140,7 +141,7 @@ app.get('/api/stream/odds', (req, res) => {
     unsubscribes.push(unsubSportsbook);
 
     // --- LOTTERY QUERY ---
-    const lotteryQuery = query(collection(db, 'Lottery'), where('exEventId', '==', eventId), where('isClosed', '==', 0));
+    const lotteryQuery = query(collection(db, 'Lottery'), where('exEventId', '==', eventId));
     const unsubLottery = onSnapshot(lotteryQuery, (snapshot) => {
         snapshot.docChanges().forEach((change) => {
             if (change.type === "added" || change.type === "modified") {

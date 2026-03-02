@@ -20,7 +20,7 @@ Agar aap apni iss API ko ek live server pe 24/7 chalana chahte hain continuously
 5. Key Pair create karke download karein (`.pem` file), ye SSH connection ke kaam aati hai.
 6. **Network/Security Groups:** 
    - HTTP (80) & HTTPS (443) allow karein.
-   - Custom TCP rule me Port `3001` allow karein (Taaki pehli dafa direct port se test ho sake).
+   - Custom TCP rule me Port `3005` allow karein (Taaki pehli dafa direct port se test ho sake).
 7. "Launch" par click karein.
 
 ### Step 2: Server me SSH se Connect karein
@@ -58,18 +58,23 @@ pm2 save
 pm2 startup
 ```
 🚀 *Aur bas! Aapki API AWS par Deploy ho gayi hai.*
-Aap usay aapki Public IP se HTTP ke zariye Check Kar sakte hain:
-`http://aapki_ec2_public_IP:3001/api/stream/odds?eventId=123&sportId=4`
+Aap isay aapki Public IP se HTTP ke zariye Check Kar sakte hain:
+
+**Live Odds Stream (SSE):**
+`http://aapki_ec2_public_IP:3005/api/stream/odds?eventId=4002026325510618&sportId=4`
+
+**Market List (JSON):**
+`http://aapki_ec2_public_IP:3005/api/markets/list?eventId=4002026325510618&sportId=4`
 
 ---
 
 ### Step 6: Domain Lagana (Optional lekin Zaroori)
 1. Kisi domain provider (jaise GoDaddy) se apne server IP par A Record set karein (jaise `api.playsport.com`).
-2. Server me NGINX install karein taaki hum port 3001 ko web port 80/443 se link kar sakein.
+2. Server me NGINX install karein taaki hum port 3005 ko web port 80/443 se link kar sakein.
 ```bash
 sudo apt install nginx -y
 ```
-3. Nginx file me code likhkar usay `proxy_pass http://localhost:3001` kar dein.
+3. Nginx file me code likhkar usay `proxy_pass http://localhost:3005` kar dein.
 4. SSL lagane ke liye Let's Encrypt (Certbot) run karein, jis se aapki website **HTTPS** ho jayegi.
 
 *Ab aapka Client (Jisko aap API bech rahe hain) kisi bhi browser se aapse Real-Time SSE stream asani se secure HTTPS tareeke se le payega!*

@@ -4,6 +4,7 @@ import cors from 'cors';
 // Import Routes
 import streamRoutes from './src/routes/streamRoutes.js';
 import marketRoutes from './src/routes/marketRoutes.js';
+import { imageProxyController } from './src/controllers/streamController.js';
 
 const app = express();
 app.use(cors());
@@ -12,9 +13,13 @@ app.use(cors());
 app.use('/api/stream', streamRoutes);
 app.use('/api/markets', marketRoutes);
 
+// --- IMAGE/VIDEO PROXY ---
+app.get('/api/users/images/:filename', imageProxyController);
+
 const PORT = process.env.PORT || 3005;
 app.listen(PORT, () => {
     console.log(`🚀 Kingexchange API Server is running on port ${PORT}`);
     console.log(`Client Stream URL Format: http://localhost:${PORT}/api/stream/odds?eventId={EVENT_ID}&sportId={SPORT_ID}`);
+    console.log(`Ball-by-Ball Stream:    http://localhost:${PORT}/api/stream/ballbyball?eventId={EVENT_ID}&sportId={SPORT_ID}`);
     console.log(`Market List URL Format:   http://localhost:${PORT}/api/markets/list?eventId={EVENT_ID}&sportId={SPORT_ID}`);
 });

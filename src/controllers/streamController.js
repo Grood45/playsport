@@ -14,6 +14,125 @@ const resolveVideoUrl = (video, baseUrl) => {
     };
 };
 
+/**
+ * StreamManager handles singleton Firestore listeners per event.
+ * This prevents opening 5 new listeners for every single user.
+ */
+class StreamManager {
+    constructor() {
+        this.streams = new Map(); // key: sportId_eventId
+    }
+
+    getStreamKey(sportId, eventId) {
+        return `${sportId}_${eventId}`;
+    }
+
+    subscribe(sportId, eventId, res) {
+        const key = this.getStreamKey(sportId, eventId);
+        
+        if (!this.streams.has(key)) {
+            console.log(`[StreamManager] Creating new listener for ${key}`);
+            this.streams.set(key, this.createListener(sportId, eventId));
+        }
+
+        const stream = this.streams.get(key);
+        stream.clients.add(res);
+
+        // Send current state to the new client immediately
+        stream.lastData.forEach((data, marketKey) => {
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+        });
+
+        return () => {
+            stream.clients.delete(res);
+            if (stream.clients.size === 0) {
+                console.log(`[StreamManager] No more clients for ${key}. Closing listener.`);
+                stream.unsubscribes.forEach(unsub => unsub());
+                this.streams.delete(key);
+            }
+        };
+    }
+
+    createListener(sportId, eventId) {
+        const db = getDynamicDb(sportId);
+        const clients = new Set();
+        const lastData = new Map(); // market_id -> last_payload (to send to new users)
+        const unsubscribes = [];
+
+        const broadcast = (source, data, actionType) => {
+            const marketId = data.exMarketId || data.id || "Unknown_ID";
+            const marketKey = `${source}_${marketId}`;
+
+            let marketStatus = "OPEN";
+            if (data.oddsData?.status) {
+                marketStatus = data.oddsData.status;
+            } else if (data.isClosed === 1) {
+                marketStatus = "CLOSED";
+            }
+
+            const payload = {
+                action: actionType,
+                market_type: source,
+                market_id: marketId,
+                market_name: data.marketName || data.name || "Unknown Market",
+                is_closed: data.isClosed ?? 0,
+                status: marketStatus,
+                total_matched: data.oddsData?.totalMatched || data.totalMatched || 0,
+                runners: (data.oddsData?.runners || data.runners || []).map(r => ({
+                    id: r.selectionId,
+                    name: (data.runnersData && r.selectionId && data.runnersData[r.selectionId])
+                        ? data.runnersData[r.selectionId]
+                        : `Selection ${r.selectionId}`,
+                    status: r.status || marketStatus,
+                    back: [
+                        { price: r.price?.back?.[0]?.price || 0, size: r.price?.back?.[0]?.size || 0 },
+                        { price: r.price?.back?.[1]?.price || 0, size: r.price?.back?.[1]?.size || 0 },
+                        { price: r.price?.back?.[2]?.price || 0, size: r.price?.back?.[2]?.size || 0 }
+                    ],
+                    lay: [
+                        { price: r.price?.lay?.[0]?.price || 0, size: r.price?.lay?.[0]?.size || 0 },
+                        { price: r.price?.lay?.[1]?.price || 0, size: r.price?.lay?.[1]?.size || 0 },
+                        { price: r.price?.lay?.[2]?.price || 0, size: r.price?.lay?.[2]?.size || 0 }
+                    ]
+                }))
+            };
+
+            // Handle removal
+            if (actionType === "removed") {
+                payload.status = "REMOVED";
+                payload.is_closed = 1;
+                lastData.delete(marketKey);
+            } else {
+                lastData.set(marketKey, payload);
+            }
+
+            const message = `data: ${JSON.stringify(payload)}\n\n`;
+            clients.forEach(client => {
+                try {
+                    client.write(message);
+                } catch (e) {
+                    console.error("Broadcast write error:", e.message);
+                }
+            });
+        };
+
+        const collections = ['Betfair', 'Bookmakers', 'Fancy', 'Sportsbook', 'Lottery'];
+        collections.forEach(col => {
+            const q = query(collection(db, col), where('exEventId', '==', eventId));
+            const unsub = onSnapshot(q, (snapshot) => {
+                snapshot.docChanges().forEach((change) => {
+                    broadcast(col, change.doc.data(), change.type);
+                });
+            }, (error) => console.error(`${col} Listen Error:`, error.message));
+            unsubscribes.push(unsub);
+        });
+
+        return { clients, unsubscribes, lastData };
+    }
+}
+
+const oddsManager = new StreamManager();
+
 export const imageProxyController = (req, res) => {
     const { filename } = req.params;
     const targetUrl = `${FAST_SOURCE_DOMAIN}/api/users/images/${filename}`;
@@ -61,10 +180,11 @@ export const streamOdds = (req, res) => {
         return res.status(400).json({ error: "eventId and sportId are required" });
     }
 
-    // 1. Mandatory Headers for SSE (Server-Sent Events)
+    // 1. Mandatory Headers for SSE
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable Nginx buffering
 
     // Flush headers to establish the initial connection
     res.flushHeaders();
@@ -72,120 +192,122 @@ export const streamOdds = (req, res) => {
     // Initial message
     res.write(`data: ${JSON.stringify({ type: 'connected', message: "Stream started" })}\n\n`);
 
-    const db = getDynamicDb(sportId);
-    let isConnectionOpen = true;
-    const unsubscribes = [];
+    // Subscribe to the shared listener
+    const unsubscribe = oddsManager.subscribe(sportId, eventId, res);
 
-    const streamData = (source, data, actionType) => {
-        if (!isConnectionOpen) return;
-
-        // Ensure we always have a market ID
-        const marketId = data.exMarketId || data.id || "Unknown_ID";
-
-        // Handle completely REMOVED markets from Firestore
-        if (actionType === "removed") {
-            const payload = {
-                action: "removed",
-                market_type: source,
-                market_id: marketId,
-                status: "REMOVED",
-                is_closed: 1
-            };
-            res.write(`data: ${JSON.stringify(payload)}\n\n`);
-            return;
-        }
-
-        // Handle SUSPENDED/CLOSED correctly based on firestore properties
-        let marketStatus = "OPEN";
-        if (data.oddsData?.status) {
-            marketStatus = data.oddsData.status;
-        } else if (data.isClosed === 1) {
-            marketStatus = "CLOSED";
-        }
-
-        // Clean, structured payload for ADDED and MODIFIED
-        const payload = {
-            action: actionType, // "added" or "modified"
-            market_type: source,
-            market_id: marketId,
-            market_name: data.marketName || data.name || "Unknown Market",
-            is_closed: data.isClosed ?? 0,
-            status: marketStatus,
-            total_matched: data.oddsData?.totalMatched || data.totalMatched || 0,
-            runners: (data.oddsData?.runners || data.runners || []).map(r => ({
-                id: r.selectionId,
-                name: (data.runnersData && r.selectionId && data.runnersData[r.selectionId])
-                    ? data.runnersData[r.selectionId]
-                    : `Selection ${r.selectionId}`,
-                status: r.status || marketStatus, // Pass runner status (e.g., SUSPENDED/ACTIVE)
-                back: [
-                    { price: r.price?.back?.[0]?.price || 0, size: r.price?.back?.[0]?.size || 0 },
-                    { price: r.price?.back?.[1]?.price || 0, size: r.price?.back?.[1]?.size || 0 },
-                    { price: r.price?.back?.[2]?.price || 0, size: r.price?.back?.[2]?.size || 0 }
-                ],
-                lay: [
-                    { price: r.price?.lay?.[0]?.price || 0, size: r.price?.lay?.[0]?.size || 0 },
-                    { price: r.price?.lay?.[1]?.price || 0, size: r.price?.lay?.[1]?.size || 0 },
-                    { price: r.price?.lay?.[2]?.price || 0, size: r.price?.lay?.[2]?.size || 0 }
-                ]
-            }))
-        };
-
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    };
-
-    // --- BETFAIR QUERY ---
-    const betfairQuery = query(collection(db, 'Betfair'), where('exEventId', '==', eventId));
-    const unsubBetfair = onSnapshot(betfairQuery, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-            streamData("Betfair", change.doc.data(), change.type);
-        });
-    }, (error) => console.error("Betfair Listen Error:", error.message));
-    unsubscribes.push(unsubBetfair);
-
-    // --- BOOKMAKERS QUERY ---
-    const bookmakerQuery = query(collection(db, 'Bookmakers'), where('exEventId', '==', eventId));
-    const unsubBookmaker = onSnapshot(bookmakerQuery, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-            streamData("Bookmakers", change.doc.data(), change.type);
-        });
-    }, (error) => console.error("Bookmaker Listen Error:", error.message));
-    unsubscribes.push(unsubBookmaker);
-
-    // --- FANCY QUERY ---
-    const fancyQuery = query(collection(db, 'Fancy'), where('exEventId', '==', eventId));
-    const unsubFancy = onSnapshot(fancyQuery, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-            streamData("Fancy", change.doc.data(), change.type);
-        });
-    }, (error) => console.error("Fancy Listen Error:", error.message));
-    unsubscribes.push(unsubFancy);
-
-    // --- SPORTSBOOK QUERY ---
-    const sportsbookQuery = query(collection(db, 'Sportsbook'), where('exEventId', '==', eventId));
-    const unsubSportsbook = onSnapshot(sportsbookQuery, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-            streamData("Sportsbook", change.doc.data(), change.type);
-        });
-    }, (error) => console.error("Sportsbook Listen Error:", error.message));
-    unsubscribes.push(unsubSportsbook);
-
-    // --- LOTTERY QUERY ---
-    const lotteryQuery = query(collection(db, 'Lottery'), where('exEventId', '==', eventId));
-    const unsubLottery = onSnapshot(lotteryQuery, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-            streamData("Lottery", change.doc.data(), change.type);
-        });
-    }, (error) => console.error("Lottery Listen Error:", error.message));
-    unsubscribes.push(unsubLottery);
-
-    // 2. Handle Client Disconnect
+    // Handle Client Disconnect
     req.on('close', () => {
         console.log(`Client disconnected from eventId: ${eventId}`);
-        isConnectionOpen = false;
-        unsubscribes.forEach(unsub => unsub());
+        unsubscribe();
     });
 };
+
+
+class BallByBallManager {
+    constructor() {
+        this.streams = new Map();
+    }
+
+    getStreamKey(sportId, eventId) {
+        return `${sportId}_${eventId}`;
+    }
+
+    subscribe(sportId, eventId, res, baseUrl) {
+        const key = this.getStreamKey(sportId, eventId);
+        
+        if (!this.streams.has(key)) {
+            this.streams.set(key, this.createListener(sportId, eventId, baseUrl));
+        }
+
+        const stream = this.streams.get(key);
+        stream.clients.add(res);
+
+        stream.lastData.forEach((data) => {
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+        });
+
+        return () => {
+            stream.clients.delete(res);
+            if (stream.clients.size === 0) {
+                stream.unsubscribe();
+                this.streams.delete(key);
+            }
+        };
+    }
+
+    createListener(sportId, eventId, baseUrl) {
+        const db = getDynamicDb(sportId);
+        const clients = new Set();
+        const lastData = new Map();
+
+        const broadcast = (data, actionType) => {
+            const marketId = data.exMarketId || data.id || "Unknown_ID";
+            let marketStatus = "OPEN";
+            if (data.oddsData?.status) {
+                marketStatus = data.oddsData.status;
+            } else if (data.isClosed === 1) {
+                marketStatus = "CLOSED";
+            }
+
+            const payload = {
+                action: actionType,
+                market_type: 'Sportsbook',
+                market_id: marketId,
+                market_name: data.marketName || data.name || "Unknown Market",
+                is_closed: data.isClosed ?? 0,
+                status: marketStatus,
+                total_matched: data.oddsData?.totalMatched || data.totalMatched || 0,
+                video: resolveVideoUrl(data.oddsData?.video, baseUrl),
+                runners: (data.oddsData?.runners || data.runners || []).map(r => ({
+                    id: r.selectionId,
+                    name: (data.runnersData && r.selectionId && data.runnersData[r.selectionId])
+                        ? data.runnersData[r.selectionId]
+                        : `Selection ${r.selectionId}`,
+                    status: r.status || marketStatus,
+                    back: [
+                        { price: r.price?.back?.[0]?.price || 0, size: r.price?.back?.[0]?.size || 0 },
+                        { price: r.price?.back?.[1]?.price || 0, size: r.price?.back?.[1]?.size || 0 },
+                        { price: r.price?.back?.[2]?.price || 0, size: r.price?.back?.[2]?.size || 0 }
+                    ],
+                    lay: [
+                        { price: r.price?.lay?.[0]?.price || 0, size: r.price?.lay?.[0]?.size || 0 },
+                        { price: r.price?.lay?.[1]?.price || 0, size: r.price?.lay?.[1]?.size || 0 },
+                        { price: r.price?.lay?.[2]?.price || 0, size: r.price?.lay?.[2]?.size || 0 }
+                    ]
+                }))
+            };
+
+            if (actionType === "removed") {
+                lastData.delete(marketId);
+            } else {
+                lastData.set(marketId, payload);
+            }
+
+            const message = `data: ${JSON.stringify(payload)}\n\n`;
+            clients.forEach(client => {
+                try {
+                    client.write(message);
+                } catch (e) {}
+            });
+        };
+
+        const q = query(
+            collection(db, 'Sportsbook'),
+            where('exEventId', '==', eventId),
+            where('marketName', '==', 'Ball By Ball')
+        );
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            snapshot.docChanges().forEach((change) => {
+                broadcast(change.doc.data(), change.type);
+            });
+        }, (error) => console.error("Ball-by-Ball Listen Error:", error.message));
+
+        return { clients, unsubscribe, lastData };
+    }
+}
+
+const ballByBallManager = new BallByBallManager();
 
 export const streamBallByBall = (req, res) => {
     const { eventId, sportId } = req.query;
@@ -198,94 +320,22 @@ export const streamBallByBall = (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
 
-    // Initial targetChange payload
+    // Initial message
     res.write(`data: ${JSON.stringify({ type: 'connected', message: "Stream started" })}\n\n`);
 
-    const db = getDynamicDb(sportId);
-    let isConnectionOpen = true;
+    const protocol = req.protocol;
+    const host = req.get('host');
+    const baseUrl = `${protocol}://${host}`;
 
-    const streamData = (source, data, actionType) => {
-        if (!isConnectionOpen) return;
+    const unsubscribe = ballByBallManager.subscribe(sportId, eventId, res, baseUrl);
 
-        const marketId = data.exMarketId || data.id || "Unknown_ID";
-
-        if (actionType === "removed") {
-            const payload = {
-                action: "removed",
-                market_type: source,
-                market_id: marketId,
-                status: "REMOVED",
-                is_closed: 1
-            };
-            res.write(`data: ${JSON.stringify(payload)}\n\n`);
-            return;
-        }
-
-        let marketStatus = "OPEN";
-        if (data.oddsData?.status) {
-            marketStatus = data.oddsData.status;
-        } else if (data.isClosed === 1) {
-            marketStatus = "CLOSED";
-        }
-
-        const protocol = req.protocol;
-        const host = req.get('host');
-        const baseUrl = `${protocol}://${host}`;
-
-        const payload = {
-            action: actionType,
-            market_type: source,
-            market_id: marketId,
-            market_name: data.marketName || data.name || "Unknown Market",
-            is_closed: data.isClosed ?? 0,
-            status: marketStatus,
-            total_matched: data.oddsData?.totalMatched || data.totalMatched || 0,
-            video: resolveVideoUrl(data.oddsData?.video, baseUrl),
-            runners: (data.oddsData?.runners || data.runners || []).map(r => ({
-                id: r.selectionId,
-                name: (data.runnersData && r.selectionId && data.runnersData[r.selectionId])
-                    ? data.runnersData[r.selectionId]
-                    : `Selection ${r.selectionId}`,
-                status: r.status || marketStatus,
-                back: [
-                    { price: r.price?.back?.[0]?.price || 0, size: r.price?.back?.[0]?.size || 0 },
-                    { price: r.price?.back?.[1]?.price || 0, size: r.price?.back?.[1]?.size || 0 },
-                    { price: r.price?.back?.[2]?.price || 0, size: r.price?.back?.[2]?.size || 0 }
-                ],
-                lay: [
-                    { price: r.price?.lay?.[0]?.price || 0, size: r.price?.lay?.[0]?.size || 0 },
-                    { price: r.price?.lay?.[1]?.price || 0, size: r.price?.lay?.[1]?.size || 0 },
-                    { price: r.price?.lay?.[2]?.price || 0, size: r.price?.lay?.[2]?.size || 0 }
-                ]
-            }))
-        };
-
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    };
-
-    // Use Sportsbook collection and filter by exEventId and marketName === 'Ball By Ball'
-    const collectionName = 'Sportsbook';
-
-    const scoreQuery = query(
-        collection(db, collectionName),
-        where('exEventId', '==', eventId),
-        where('marketName', '==', 'Ball By Ball')
-    );
-
-    const unsubscribe = onSnapshot(scoreQuery, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-            streamData(collectionName, change.doc.data(), change.type);
-        });
-    }, (error) => {
-        console.error("Ball-by-Ball Listen Error:", error.message);
-    });
-
-    // 2. Handle Client Disconnect
+    // Handle Client Disconnect
     req.on('close', () => {
         console.log(`Ball-by-ball client disconnected from eventId: ${eventId}`);
-        isConnectionOpen = false;
         unsubscribe();
     });
 };
+

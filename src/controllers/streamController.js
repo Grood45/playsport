@@ -122,6 +122,11 @@ class StreamManager {
                 lastData.delete(marketKey);
             } else {
                 lastData.set(marketKey, payload);
+                // If market is closed, remove from cache after 6s
+                // so new clients don't receive stale closed markets
+                if (payload.is_closed === 1) {
+                    setTimeout(() => lastData.delete(marketKey), 6000);
+                }
             }
 
             const message = `data: ${JSON.stringify(payload)}\n\n`;
@@ -328,6 +333,10 @@ class BallByBallManager {
                 lastData.delete(marketId);
             } else {
                 lastData.set(marketId, payload);
+                // If market is closed, remove from cache after 6s
+                if (payload.is_closed === 1) {
+                    setTimeout(() => lastData.delete(marketId), 6000);
+                }
             }
 
             const message = `data: ${JSON.stringify(payload)}\n\n`;

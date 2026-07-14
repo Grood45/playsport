@@ -1,11 +1,25 @@
 import { collection, query, where } from 'firebase/firestore';
 import { getDynamicDb } from '../config/firebase.js';
 
+// --- In-Memory Cache ---
+// Cache: key = "sportId_eventId", value = { data, expiresAt }
+const marketCache = new Map();
+const CACHE_TTL_MS = 4000; // 4 seconds
+
 export const getMarketList = async (req, res) => {
     const { eventId, sportId } = req.query;
 
     if (!eventId || !sportId) {
         return res.status(400).json({ error: "eventId and sportId are required" });
+    }
+
+    const cacheKey = `${sportId}_${eventId}`;
+    const now = Date.now();
+
+    // Serve from cache if available and not expired
+    const cached = marketCache.get(cacheKey);
+    if (cached && now < cached.expiresAt) {
+        return res.status(200).json(cached.data);
     }
 
     try {
@@ -67,6 +81,9 @@ export const getMarketList = async (req, res) => {
         });
 
         await Promise.all(promises);
+
+        // Store in cache
+        marketCache.set(cacheKey, { data: responseData, expiresAt: now + CACHE_TTL_MS });
 
         return res.status(200).json(responseData);
 

@@ -21,6 +21,7 @@ const resolveVideoUrl = (video, baseUrl) => {
 class StreamManager {
     constructor() {
         this.streams = new Map(); // key: sportId_eventId
+        this.unsubscribeTimeouts = new Map(); // key: sportId_eventId -> timeoutId
     }
 
     getStreamKey(sportId, eventId) {
@@ -30,6 +31,13 @@ class StreamManager {
     subscribe(sportId, eventId, res) {
         const key = this.getStreamKey(sportId, eventId);
         
+        // If there is a pending unsubscribe timeout, cancel it
+        if (this.unsubscribeTimeouts.has(key)) {
+            console.log(`[StreamManager] Reusing active listener for ${key}. Cancelling unsubscribe timeout.`);
+            clearTimeout(this.unsubscribeTimeouts.get(key));
+            this.unsubscribeTimeouts.delete(key);
+        }
+
         if (!this.streams.has(key)) {
             console.log(`[StreamManager] Creating new listener for ${key}`);
             this.streams.set(key, this.createListener(sportId, eventId));
@@ -46,9 +54,19 @@ class StreamManager {
         return () => {
             stream.clients.delete(res);
             if (stream.clients.size === 0) {
-                console.log(`[StreamManager] No more clients for ${key}. Closing listener.`);
-                stream.unsubscribes.forEach(unsub => unsub());
-                this.streams.delete(key);
+                console.log(`[StreamManager] No active clients for ${key}. Scheduling unsubscribe in 60s.`);
+                
+                const timeoutId = setTimeout(() => {
+                    const activeStream = this.streams.get(key);
+                    if (activeStream && activeStream.clients.size === 0) {
+                        console.log(`[StreamManager] Grace period expired. Closing listener for ${key}.`);
+                        activeStream.unsubscribes.forEach(unsub => unsub());
+                        this.streams.delete(key);
+                    }
+                    this.unsubscribeTimeouts.delete(key);
+                }, 60000); // 60 seconds grace period
+                
+                this.unsubscribeTimeouts.set(key, timeoutId);
             }
         };
     }
@@ -192,12 +210,22 @@ export const streamOdds = (req, res) => {
     // Initial message
     res.write(`data: ${JSON.stringify({ type: 'connected', message: "Stream started" })}\n\n`);
 
+    // Send heartbeat (ping) every 30 seconds to keep connection alive
+    const heartbeatInterval = setInterval(() => {
+        try {
+            res.write(`: heartbeat\n\n`);
+        } catch (e) {
+            console.error("Heartbeat error (streamOdds):", e.message);
+        }
+    }, 30000);
+
     // Subscribe to the shared listener
     const unsubscribe = oddsManager.subscribe(sportId, eventId, res);
 
     // Handle Client Disconnect
     req.on('close', () => {
         console.log(`Client disconnected from eventId: ${eventId}`);
+        clearInterval(heartbeatInterval);
         unsubscribe();
     });
 };
@@ -206,6 +234,7 @@ export const streamOdds = (req, res) => {
 class BallByBallManager {
     constructor() {
         this.streams = new Map();
+        this.unsubscribeTimeouts = new Map(); // key: sportId_eventId -> timeoutId
     }
 
     getStreamKey(sportId, eventId) {
@@ -215,6 +244,13 @@ class BallByBallManager {
     subscribe(sportId, eventId, res, baseUrl) {
         const key = this.getStreamKey(sportId, eventId);
         
+        // If there is a pending unsubscribe timeout, cancel it
+        if (this.unsubscribeTimeouts.has(key)) {
+            console.log(`[BallByBallManager] Reusing active listener for ${key}. Cancelling unsubscribe timeout.`);
+            clearTimeout(this.unsubscribeTimeouts.get(key));
+            this.unsubscribeTimeouts.delete(key);
+        }
+
         if (!this.streams.has(key)) {
             this.streams.set(key, this.createListener(sportId, eventId, baseUrl));
         }
@@ -229,8 +265,19 @@ class BallByBallManager {
         return () => {
             stream.clients.delete(res);
             if (stream.clients.size === 0) {
-                stream.unsubscribe();
-                this.streams.delete(key);
+                console.log(`[BallByBallManager] No active clients for ${key}. Scheduling unsubscribe in 60s.`);
+                
+                const timeoutId = setTimeout(() => {
+                    const activeStream = this.streams.get(key);
+                    if (activeStream && activeStream.clients.size === 0) {
+                        console.log(`[BallByBallManager] Grace period expired. Closing listener for ${key}.`);
+                        activeStream.unsubscribe();
+                        this.streams.delete(key);
+                    }
+                    this.unsubscribeTimeouts.delete(key);
+                }, 60000); // 60 seconds grace period
+                
+                this.unsubscribeTimeouts.set(key, timeoutId);
             }
         };
     }
@@ -326,6 +373,15 @@ export const streamBallByBall = (req, res) => {
     // Initial message
     res.write(`data: ${JSON.stringify({ type: 'connected', message: "Stream started" })}\n\n`);
 
+    // Send heartbeat (ping) every 30 seconds to keep connection alive
+    const heartbeatInterval = setInterval(() => {
+        try {
+            res.write(`: heartbeat\n\n`);
+        } catch (e) {
+            console.error("Heartbeat error (streamBallByBall):", e.message);
+        }
+    }, 30000);
+
     const protocol = req.protocol;
     const host = req.get('host');
     const baseUrl = `${protocol}://${host}`;
@@ -335,6 +391,7 @@ export const streamBallByBall = (req, res) => {
     // Handle Client Disconnect
     req.on('close', () => {
         console.log(`Ball-by-ball client disconnected from eventId: ${eventId}`);
+        clearInterval(heartbeatInterval);
         unsubscribe();
     });
 };
